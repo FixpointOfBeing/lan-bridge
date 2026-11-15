@@ -694,7 +694,7 @@ async fn run(dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let ip = std::env::var("LAN_IP")
         .ok()
         .or_else(local_ip)
-        .ok_or("未找到局域网 IPv4 地址。可设置 LAN_INTERFACE=wlp58s0 或 LAN_IP=192.168.1.95")?;
+        .ok_or("未找到局域网 IPv4 地址。可设置 LAN_INTERFACE")?;
     let key = Uuid::new_v4().to_string();
     fs::create_dir_all(&dir).await?;
     let state_dir = dir.join(".lan-bridge-state");
@@ -1071,14 +1071,14 @@ mod tests {
     fn chooses_wifi_over_virtual_route() {
         let interfaces = "1: lo    inet 127.0.0.1/8 scope host lo\n\
                           2: tun0  inet 198.18.0.1/15 scope global tun0\n\
-                          3: enp1s0 inet 192.168.2.10/24 scope global enp1s0\n\
-                          4: wlp58s0 inet 192.168.1.95/24 scope global wlp58s0\n";
+                          3: en-test inet 192.168.2.10/24 scope global en-test\n\
+                          4: wl-test inet 192.168.1.95/24 scope global wl-test\n";
         assert_eq!(
             select_lan_ip(interfaces, None).as_deref(),
             Some("192.168.1.95")
         );
         assert_eq!(
-            select_lan_ip(interfaces, Some("enp1s0")).as_deref(),
+            select_lan_ip(interfaces, Some("en-test")).as_deref(),
             Some("192.168.2.10")
         );
     }
