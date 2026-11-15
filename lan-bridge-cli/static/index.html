@@ -1,0 +1,283 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>局域网传送</title><style>
+:root{font-family:system-ui,sans-serif;color:#ecf2ff;background:#101827}*{box-sizing:border-box}body{margin:0;padding:22px}main{max-width:860px;margin:auto}.card{background:#1a2840;border:1px solid #344765;border-radius:16px;padding:22px;margin:18px 0}p,.hint{color:#b5c5da}button,label.pick{display:inline-block;background:#6698f4;color:white;border:0;border-radius:9px;padding:10px 14px;font:inherit;cursor:pointer}button.alt{background:#405777}textarea{width:100%;min-height:130px;background:#101827;color:white;border:1px solid #526583;border-radius:8px;padding:10px;font:inherit}.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.file{display:flex;justify-content:space-between;align-items:center;gap:12px;border-top:1px solid #344765;padding:12px 0;word-break:break-all}input[type=file]{display:none}#status{color:#a7e4b9}
+.file-info{flex:1;min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:10px}.file>button{flex-shrink:0}.thumbnail{width:160px;max-width:100%;height:110px;padding:0;overflow:hidden;background:#101827;border:1px solid #526583;color:#b5c5da;font-size:13px}.thumbnail img{display:block;width:100%;height:100%;object-fit:contain}.thumbnail:disabled{cursor:default}button:focus-visible{outline:3px solid #a7e4b9;outline-offset:3px}#imageViewer{width:min(1100px,96vw);max-width:96vw;max-height:94vh;padding:16px;border:1px solid #526583;border-radius:12px;background:#101827;color:#ecf2ff}#imageViewer::backdrop{background:#000c}.viewer-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}#imageTitle{margin:0;min-width:0;overflow-wrap:anywhere}#fullImage{display:block;max-width:100%;max-height:75vh;margin:auto;object-fit:contain}.viewer-header button{flex-shrink:0}
+</style></head><body><main>
+<h1>局域网传送</h1><p>手机和电脑连接同一 Wi-Fi，交换文件与文本。</p>
+<div class="row"><span id="connection" role="status">正在连接…</span><button id="reconnect" class="alt" disabled>重新连接</button></div>
+<section class="card"><h2>文本分享</h2><p class="hint">在任一设备输入文本并发送。已连接的其他设备会收到更新；只保留最新一条文本，重启服务后仍可查看。</p>
+<textarea id="textInput" placeholder="在这里输入或粘贴文本"></textarea>
+<div class="row"><button id="send">发送文本</button><button id="refreshText" class="alt">刷新文本</button></div>
+<p id="textStatus" class="hint" role="status"></p><h3>最新分享文本</h3><textarea id="latest" readonly placeholder="还没有分享文本"></textarea></section>
+<section class="card"><h2>文件</h2><p class="hint">网页上传后自动更新列表。电脑上直接放入或删除文件后，请点击“刷新文件列表”。PNG、JPEG、WebP、GIF 图片可点击预览放大；超过 20 MiB 的图片请下载查看。</p>
+<div class="row"><label class="pick" for="files">选择文件上传</label><button id="refreshFiles" class="alt">刷新文件列表</button></div>
+<input type="file" id="files" multiple><p id="status" role="status"></p><p id="listStatus" class="hint" role="status"></p><div id="list"></div></section>
+</main>
+<dialog id="imageViewer" aria-labelledby="imageTitle"><div class="viewer-header"><h2 id="imageTitle"></h2><button id="closeImage" class="alt" autofocus>关闭</button></div><img id="fullImage" alt=""></dialog>
+<script>
+const key = '__KEY__', h = {'X-Access-Key': key}, $ = id => document.getElementById(id);
+let revision = -1, socket, filesLoading = false, filesPending = false;
+
+async function req(path, opts = {}) {
+  const response = await fetch(path, {...opts, headers: {...h, ...opts.headers}});
+  if (!response.ok) {
+    const requestId = response.headers.get('x-request-id');
+    // Do not show framework rejection details, which may echo invalid input.
+    const message = response.status === 401 ? '访问密钥无效，请重新扫码'
+      : response.status === 413 ? '内容超过大小限制'
+      : '操作失败（HTTP ' + response.status + '）';
+    throw Error(message + (requestId ? '，请求 ID：' + requestId : ''));
+  }
+  return response;
+}
+
+function size(n) {
+  return n < 1024 ? n + ' B' : n < 1048576 ? (n / 1024).toFixed(1) + ' KiB' : (n / 1048576).toFixed(1) + ' MiB';
+}
+
+const PREVIEW_LIMIT = 20 * 1024 * 1024;
+const previews = new Map();
+let previewQueue = [], previewsActive = 0;
+const previewObserver = typeof IntersectionObserver === 'function'
+  ? new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) enqueuePreview(previews.get(entry.target));
+    }
+  }, {rootMargin: '200px'}) : null;
+
+function closeImage() {
+  $('imageViewer').close();
+  $('fullImage').removeAttribute('src');
+  $('fullImage').alt = '';
+  $('imageTitle').textContent = '';
+}
+$('closeImage').onclick = closeImage;
+$('imageViewer').addEventListener('close', () => {
+  $('fullImage').removeAttribute('src');
+});
+$('imageViewer').addEventListener('click', event => {
+  if (event.target === $('imageViewer')) {
+    const bounds = $('imageViewer').getBoundingClientRect();
+    if (event.clientX < bounds.left || event.clientX > bounds.right
+      || event.clientY < bounds.top || event.clientY > bounds.bottom) closeImage();
+  }
+});
+
+function clearPreviews() {
+  closeImage();
+  if (previewObserver) previewObserver.disconnect();
+  for (const preview of previews.values()) {
+    preview.controller.abort();
+    if (preview.url) URL.revokeObjectURL(preview.url);
+  }
+  previews.clear();
+  previewQueue = [];
+}
+
+function imageMime(bytes) {
+  const starts = signature => signature.every((value, index) => bytes[index] === value);
+  if (starts([137, 80, 78, 71, 13, 10, 26, 10])) return 'image/png';
+  if (starts([255, 216, 255])) return 'image/jpeg';
+  const text = String.fromCharCode(...bytes);
+  if (text.startsWith('GIF87a') || text.startsWith('GIF89a')) return 'image/gif';
+  if (text.startsWith('RIFF') && text.slice(8, 12) === 'WEBP') return 'image/webp';
+  throw Error('不是支持的图片格式，请下载查看');
+}
+
+async function previewBlob(response) {
+  const reader = response.body.getReader(), chunks = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > PREVIEW_LIMIT) throw Error('图片超过 20 MiB，请下载查看');
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally { reader.releaseLock(); }
+  const blob = new Blob(chunks);
+  const mime = imageMime(new Uint8Array(await blob.slice(0, 12).arrayBuffer()));
+  return new Blob([blob], {type: mime});
+}
+
+function addPreview(file, container) {
+  if (!/\.(png|jpe?g|webp|gif)$/i.test(file.name)) return;
+  if (file.size > PREVIEW_LIMIT) {
+    const hint = document.createElement('small');
+    hint.textContent = '图片超过 20 MiB，请下载查看';
+    container.append(hint);
+    return;
+  }
+  const button = document.createElement('button');
+  button.className = 'thumbnail';
+  button.textContent = previewObserver ? '图片预览待加载…' : '点击加载图片预览';
+  button.setAttribute('aria-label', '预览图片：' + file.name);
+  const preview = {file, button, controller: new AbortController(), state: 'waiting', url: null};
+  previews.set(button, preview);
+  button.onclick = () => {
+    if (!preview.url) { enqueuePreview(preview); return; }
+    $('imageTitle').textContent = file.name;
+    $('fullImage').alt = file.name;
+    $('fullImage').src = preview.url;
+    $('imageViewer').showModal();
+  };
+  container.append(button);
+  if (previewObserver) previewObserver.observe(button);
+}
+
+function enqueuePreview(preview) {
+  if (!preview || preview.state !== 'waiting') return;
+  preview.state = 'queued';
+  if (previewObserver) previewObserver.unobserve(preview.button);
+  previewQueue.push(preview);
+  drainPreviews();
+}
+
+function drainPreviews() {
+  while (previewsActive < 2 && previewQueue.length) {
+    const preview = previewQueue.shift();
+    previewsActive++;
+    loadPreview(preview).finally(() => { previewsActive--; drainPreviews(); });
+  }
+}
+
+async function loadPreview(preview) {
+  const {button, file, controller} = preview;
+  button.textContent = '图片加载中…';
+  button.disabled = true;
+  let url;
+  try {
+    // Use authenticated fetch, not an img URL containing the access key.
+    const response = await req('/api/files/' + encodeURIComponent(file.id), {signal: controller.signal});
+    const blob = await previewBlob(response);
+    if (controller.signal.aborted) return;
+    url = URL.createObjectURL(blob);
+    const image = document.createElement('img');
+    image.alt = file.name;
+    image.decoding = 'async';
+    image.src = url;
+    await image.decode();
+    if (controller.signal.aborted) { URL.revokeObjectURL(url); return; }
+    preview.url = url;
+    preview.state = 'ready';
+    button.replaceChildren(image);
+    button.title = '点击放大';
+    button.disabled = false;
+  } catch (error) {
+    if (url) URL.revokeObjectURL(url);
+    if (controller.signal.aborted) return;
+    preview.state = 'failed';
+    button.textContent = '无法预览，请下载查看';
+    button.title = error.message;
+  }
+}
+
+window.addEventListener('pagehide', event => {
+  if (!event.persisted) clearPreviews();
+});
+
+async function files() {
+  // Coalesce change notifications, never race older lists against newer ones.
+  if (filesLoading) { filesPending = true; return; }
+  filesLoading = true;
+  try {
+    do {
+      filesPending = false;
+      const data = await (await req('/api/files')).json();
+      clearPreviews();
+      $('list').replaceChildren();
+      if (!data.length) $('list').textContent = '还没有文件';
+      for (const f of data) {
+        const row = document.createElement('div'), info = document.createElement('div'), name = document.createElement('span'), btn = document.createElement('button');
+        row.className = 'file';
+        info.className = 'file-info';
+        name.textContent = f.name + ' · ' + size(f.size);
+        info.append(name);
+        addPreview(f, info);
+        btn.textContent = '下载';
+        btn.onclick = async () => {
+          try {
+            const blob = await (await req('/api/files/' + encodeURIComponent(f.id))).blob();
+            const url = URL.createObjectURL(blob), a = document.createElement('a');
+            a.href = url; a.download = f.name; a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 60000);
+          } catch (e) { $('status').textContent = e.message; }
+        };
+        row.append(info, btn); $('list').append(row);
+      }
+      $('listStatus').textContent = '';
+    } while (filesPending);
+  } catch (e) {
+    filesPending = false;
+    $('listStatus').textContent = '列表刷新失败：' + e.message;
+  } finally { filesLoading = false; }
+}
+
+$('files').onchange = async e => {
+  const selected = [...e.target.files];
+  if (!selected.length) return;
+  const form = new FormData();
+  for (const file of selected) form.append('file', file);
+  $('status').textContent = '上传中…';
+  try {
+    const data = await (await req('/api/files', {method: 'POST', body: form})).json();
+    $('status').textContent = '上传完成：' + data.map(f => f.name).join('、');
+    await files();
+  } catch (error) { $('status').textContent = '上传失败：' + error.message; }
+  e.target.value = '';
+};
+
+function showLatest(data) {
+  if (data.revision < revision) return;
+  revision = data.revision;
+  $('latest').value = data.text;
+  $('textStatus').textContent = '已加载 · 版本 ' + data.revision;
+}
+
+async function refreshText() {
+  try { showLatest(await (await req('/api/text')).json()); }
+  catch (e) { $('textStatus').textContent = '文本刷新失败：' + e.message; }
+}
+
+$('send').onclick = async () => {
+  $('send').disabled = true;
+  try {
+    showLatest(await (await req('/api/text', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text: $('textInput').value})
+    })).json());
+  } catch (e) { $('textStatus').textContent = '发送失败：' + e.message; }
+  finally { $('send').disabled = false; }
+};
+
+function connect() {
+  if (socket && socket.readyState < WebSocket.CLOSING) return;
+  $('reconnect').disabled = true;
+  $('connection').textContent = '正在连接…';
+  // A restarted service can have a lower revision; reload after readiness.
+  revision = -1;
+  socket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://')
+    + location.host + '/api/events?key=' + encodeURIComponent(key));
+  socket.onmessage = event => {
+    if (event.data === 'ready') {
+      $('connection').textContent = '已连接，更新将自动通知';
+      refreshText(); files();
+    } else if (event.data === 'text_changed') refreshText();
+    else if (event.data === 'files_changed') files();
+    else if (event.data === 'refresh') { refreshText(); files(); }
+  };
+  socket.onerror = () => { $('connection').textContent = '连接失败，请手动重新连接；若服务已重启，请重新扫码'; };
+  socket.onclose = () => {
+    $('connection').textContent = '连接已断开，不会自动重连；请重新连接或重新扫码';
+    $('reconnect').disabled = false;
+  };
+}
+
+$('reconnect').onclick = connect;
+$('refreshText').onclick = refreshText;
+$('refreshFiles').onclick = files;
+connect();
+</script></body></html>

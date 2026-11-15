@@ -1,0 +1,28 @@
+# Rust build output (keep Cargo.lock for this application)
+target/
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Shared files, persisted text and runtime logs may contain private data
+shared-files/
+.lan-bridge-state/
+server.log
+*.log
+
+# Local environment settings (keep example files)
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Editor and OS temporary files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
